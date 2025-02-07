@@ -1,0 +1,77 @@
+// Define Uganda region 
+var studyRegion = ee.FeatureCollection("FAO/GAUL/2015/level0")
+                     .filter(ee.Filter.eq("ADM0_NAME", "Uganda"))
+                     .geometry();  // Convert FeatureCollection to Geometry
+
+// Load MODIS NDVI dataset for Uganda
+var modisNDVI = ee.ImageCollection('MODIS/006/MOD13A1')
+                  .select('NDVI')
+                  .filterBounds(studyRegion)
+                  .filterDate('2000-01-01', '2024-12-31');  // Filter from 2000 to 2024
+
+// Scale NDVI values
+var scaledNDVI = modisNDVI.map(function(image) {
+  return image.multiply(0.0001).copyProperties(image, ['system:time_start']);
+});
+
+// Compute NDVI min/max within Uganda
+var ndviMin = scaledNDVI.reduce(ee.Reducer.min()).clip(studyRegion);
+var ndviMax = scaledNDVI.reduce(ee.Reducer.max()).clip(studyRegion);
+
+// Function to calculate VCI
+var calculateVCI = function(image) {
+  var vci = image.expression(
+    '((NDVI - NDVI_min) / (NDVI_max - NDVI_min + 0.0001)) * 100', {
+      'NDVI': image.select('NDVI'),
+      'NDVI_min': ndviMin,
+      'NDVI_max': ndviMax
+    }).rename('VCI');
+
+  return vci.clip(studyRegion);  // ✅ No need for reprojecting before exporting
+};
+
+// Apply VCI calculation to MODIS collection
+var vciCollection = scaledNDVI.map(calculateVCI).sort("system:time_start");
+
+// Function to check if a date is a biweekly date (every 14 days)
+var isBiweeklyDate = function(date) {
+  var startDate = ee.Date('2000-01-01');  // Reference start date
+  var daysSinceStart = date.difference(startDate, 'day');  // Days since start date
+  return daysSinceStart.mod(14).eq(0);  // Check if divisible by 14
+};
+
+// Filter the VCI collection to biweekly data
+var biweeklyVCI = vciCollection.filter(ee.Filter.calendarRange(1, 365, 'day_of_year'))
+                               .map(function(image) {
+                                 var date = ee.Date(image.get('system:time_start'));
+                                 return image.set('isBiweekly', isBiweeklyDate(date));
+                               })
+                               .filter(ee.Filter.eq('isBiweekly', 1));
+
+// ✅ Function to export VCI as CSV
+var exportVCICSV = function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var dateString = date.format('YYYY_MM_dd').getInfo();  // ✅ Convert to normal string
+
+  var vciSample = image.select('VCI').reduceRegions({
+    collection: studyRegion, 
+    reducer: ee.Reducer.mean(),  
+    scale: 500
+  });
+
+  Export.table.toDrive({
+    collection: vciSample,
+    description: 'VCI_CSV_' + dateString,  
+    folder: 'VCI_Exports',
+    fileNamePrefix: 'VCI_CSV_' + dateString,  
+    fileFormat: 'CSV'
+  });
+};
+
+// ✅ Loop through all biweekly images and export as CSV
+var imageList = biweeklyVCI.toList(biweeklyVCI.size());
+
+for (var i = 0; i < biweeklyVCI.size().getInfo(); i++) {
+  var image = ee.Image(imageList.get(i));
+  exportVCICSV(image);
+}
